@@ -13,15 +13,20 @@ def _load_appconfig_extension():
     app = os.getenv("APPCONFIG_APPLICATION")
     env = os.getenv("APPCONFIG_ENVIRONMENT")
     profile = os.getenv("APPCONFIG_PROFILE")
+
     if not (app and env and profile):
         return {}
-    url = f"http://localhost:2772/applications/{app}/environments/{env}/configurations/{profile}"
+
+    base = os.getenv("APPCONFIG_BASE_URL", "http://localhost:2772")
+    url  = f"{base}/applications/{app}/environments/{env}/configurations/{profile}"
+
     try:
         with urllib.request.urlopen(url, timeout=1.5) as r:
             txt = r.read().decode("utf-8")
             return json.loads(txt)
     except Exception as e:
         log.warning("AppConfig extension not available (%s); using env fallback", e)
+
         return {}
 
 def _normalize(cfg):
@@ -40,6 +45,7 @@ def _normalize(cfg):
     kinesis_stream = val("kinesis_stream_name", "KINESIS_STREAM_NAME", default=os.getenv("KINESIS_STREAM_NAME", ""))
 
     default_sizes = val("default_sizes", "DEFAULT_SIZES", default=os.getenv("DEFAULT_SIZES", "thumb,medium,large"))
+
     if isinstance(default_sizes, str):
         default_sizes = [s.strip() for s in default_sizes.split(",") if s.strip()]
 
@@ -53,13 +59,17 @@ def _normalize(cfg):
         "KINESIS_STREAM_NAME": kinesis_stream,
         "DEFAULT_SIZES": default_sizes,
     }
+
     missing = [k for k in ("BUCKET_NAME", "DDB_TABLE_METADATA", "INGEST_QUEUE_URL", "RESIZE_QUEUE_URL") if not cfg_norm.get(k)]
+
     if missing:
         raise RuntimeError(f"Missing required config: {missing}. Provide via AppConfig or ENV.")
+
     return cfg_norm
 
 def load_config():
     cfg = _load_appconfig_extension()
+
     env_overrides = {
         "BUCKET_NAME": os.getenv("BUCKET_NAME"),
         "DDB_TABLE_METADATA": os.getenv("DDB_TABLE_METADATA"),
@@ -70,9 +80,11 @@ def load_config():
         "REGION": os.getenv("REGION"),
         "DEFAULT_SIZES": os.getenv("DEFAULT_SIZES"),
     }
+
     for k, v in env_overrides.items():
         if v not in (None, ""):
             cfg[k] = v
+
     return _normalize(cfg)
 
 _CFG = load_config()
@@ -113,19 +125,24 @@ def handle_s3_ingest(evt):
         b = rec["s3"]["bucket"]["name"]
         raw_key = rec["s3"]["object"]["key"]
         key = unquote_plus(raw_key)
+
         if not _is_original_key(key):
             continue
+
         parts = key.split("/")
         image_id = parts[1] if len(parts) >= 3 else None
+
         if not image_id:
             log.warning("Could not parse imageId from key %s", key)
             continue
+
         head = s3.head_object(Bucket=b, Key=key)
         size_bytes = head["ContentLength"]
         obj = s3.get_object(Bucket=b, Key=key)
         data = obj["Body"].read()
         im = Image.open(io.BytesIO(data))
         width, height = im.size
+
         ddb.update_item(
             TableName=DDB_META,
             Key={"id": {"S": image_id}},
@@ -139,9 +156,11 @@ def handle_s3_ingest(evt):
                 ":b":{"N": str(size_bytes)}
             }
         )
+
         for sz in DEFAULT_SIZES:
             body = json.dumps({"type":"resize","bucket": b,"key": key,"imageId": image_id,"size": sz})
             sqs.send_message(QueueUrl=RESIZE_Q_URL, MessageBody=body)
+
         if KINESIS_STREAM_NAME:
             try:
                 kin.put_record(StreamName=KINESIS_STREAM_NAME, PartitionKey=image_id, Data=json.dumps({"imageId": image_id, "action":"uploaded"}))
@@ -152,22 +171,27 @@ def target_dims(size_name, src_w, src_h):
     targets = {"thumb": 150, "medium": 800, "large": 1600}
     tw = targets.get(size_name, 800)
     scale = tw / float(src_w)
+
     return int(tw), int(src_h * scale)
 
 def handle_resize_task(task):
     image_id = task["imageId"]
     src_key = task["key"]
     size_name = task["size"]
+
     obj = s3.get_object(Bucket=BUCKET, Key=src_key)
     data = obj["Body"].read()
     im = Image.open(io.BytesIO(data)).convert("RGB")
+
     w, h = im.size
     tw, th = target_dims(size_name, w, h)
     im_resized = im.resize((tw, th), Image.LANCZOS)
     out = io.BytesIO()
     im_resized.save(out, format="JPEG", quality=90)
     out.seek(0)
+
     dest_key = f"images/{image_id}/{size_name}.jpg"
+
     s3.put_object(Bucket=BUCKET, Key=dest_key, Body=out.getvalue(), ContentType="image/jpeg")
     ddb.update_item(
         TableName=DDB_META,
@@ -192,12 +216,15 @@ signal.signal(signal.SIGINT, _sigterm)
 
 def main_loop():
     log.info("Worker starting; ingest=%s resize=%s", INGEST_Q_URL, RESIZE_Q_URL)
+
     while _RUN:
         msgs = receive(RESIZE_Q_URL)
         src_queue = RESIZE_Q_URL
+
         if not msgs:
             msgs = receive(INGEST_Q_URL)
             src_queue = INGEST_Q_URL
+
         if not msgs:
             continue
         for m in msgs:
@@ -205,6 +232,7 @@ def main_loop():
             try:
                 body = m["Body"]
                 payload = json.loads(body)
+
                 if "Records" in payload:
                     handle_s3_ingest(payload)
                 elif payload.get("type") == "resize":

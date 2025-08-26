@@ -1,0 +1,24 @@
+version: "3.8"
+services:
+  appconfig:
+    image: public.ecr.aws/aws-appconfig/aws-appconfig-agent:2.x
+    environment:
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+    volumes:
+      - ~/.aws:/root/.aws:ro
+    ports:
+      - "2772:2772"   # so you can curl it from your host too
+
+  resizer:
+    image: resizer:v1
+    environment:
+      # tell the worker where the agent is
+      APPCONFIG_BASE_URL: http://appconfig:2772
+      APPCONFIG_APPLICATION: images-app
+      APPCONFIG_ENVIRONMENT: dev
+      APPCONFIG_PROFILE: resizer
+    depends_on:
+      - appconfig
+    volumes:
+      - ~/.aws:/root/.aws:ro
