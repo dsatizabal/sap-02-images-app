@@ -1,0 +1,30 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Local test for uploader
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 10
+    MemorySize: 256
+Resources:
+  Uploader:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: handler.lambda_handler
+      Runtime: python3.13
+      CodeUri: Uploader
+      Layers:
+      - arn:aws:lambda:us-east-1:027255383542:layer:AWS-AppConfig-Extension:207
+      Environment:
+        Variables:
+          APPCONFIG_APPLICATION: images-app
+          APPCONFIG_ENVIRONMENT: dev
+          APPCONFIG_PROFILE: dev
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /images/init-upload
+            Method: POST
+    Metadata:
+      SamResourceId: Uploader
