@@ -1,35 +1,50 @@
-import os, json, time, logging, io
+import os, json, time, logging, io, signal, sys, urllib.request
+from urllib.parse import unquote_plus
 import boto3
 from PIL import Image
-from urllib.parse import unquote_plus
-import urllib.request
-import signal
-import sys
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# -------- Logging / tunables --------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO),
+                    format="%(asctime)s %(levelname)s %(name)s :: %(message)s")
 log = logging.getLogger("worker")
 
+POLL_WAIT_SECONDS   = int(os.getenv("POLL_WAIT_SECONDS", "20"))
+VISIBILITY_TIMEOUT  = int(os.getenv("VISIBILITY_TIMEOUT", "60"))
+HEARTBEAT_EVERY     = int(os.getenv("HEARTBEAT_EVERY", "30"))          # loops
+QUEUE_STATS_EVERY   = int(os.getenv("QUEUE_STATS_EVERY", "60"))        # loops
+
+APPCONFIG_RETRIES     = int(os.getenv("APPCONFIG_RETRIES", "0"))       # 0 = no retry (compose wait loop usually handles it)
+APPCONFIG_RETRY_SLEEP = float(os.getenv("APPCONFIG_RETRY_SLEEP", "1"))
+
+# -------- AppConfig (Lambda extension/Agent endpoint) --------
 def _load_appconfig_extension():
     app = os.getenv("APPCONFIG_APPLICATION")
     env = os.getenv("APPCONFIG_ENVIRONMENT")
     profile = os.getenv("APPCONFIG_PROFILE")
-
     if not (app and env and profile):
+        log.info("APPCONFIG_* not set; skipping AppConfig and using ENV only.")
         return {}
 
     base = os.getenv("APPCONFIG_BASE_URL", "http://localhost:2772")
     url  = f"{base}/applications/{app}/environments/{env}/configurations/{profile}"
+    attempts = max(1, APPCONFIG_RETRIES or 1)
 
-    print("Loading config from AppConfig extension:", url)
+    for i in range(1, attempts + 1):
+        try:
+            log.info("Loading config from AppConfig: %s (try %d/%d)", url, i, attempts)
+            with urllib.request.urlopen(url, timeout=2.5) as r:
+                txt = r.read().decode("utf-8")
+                cfg = json.loads(txt)
+                log.info("AppConfig loaded with keys: %s", sorted(cfg.keys()))
+                return cfg
+        except Exception as e:
+            if i == attempts:
+                log.warning("AppConfig not reachable after %d attempts: %s; falling back to ENV", attempts, e)
+                break
+            time.sleep(APPCONFIG_RETRY_SLEEP)
 
-    try:
-        with urllib.request.urlopen(url, timeout=1.5) as r:
-            txt = r.read().decode("utf-8")
-            return json.loads(txt)
-    except Exception as e:
-        log.warning("AppConfig extension not available (%s); using env fallback", e)
-
-        return {}
+    return {}
 
 def _normalize(cfg):
     def val(*keys, default=None):
@@ -38,15 +53,14 @@ def _normalize(cfg):
                 return cfg[k]
         return default
 
-    region = val("region", "REGION", default=os.getenv("REGION", "us-east-1"))
-    bucket = val("bucket_name", "BUCKET_NAME", default=os.getenv("BUCKET_NAME"))
-    ddb_meta = val("ddb_table_metadata", "DDB_TABLE_METADATA", default=os.getenv("DDB_TABLE_METADATA"))
-    ddb_counters = val("ddb_table_counters", "DDB_TABLE_COUNTERS", default=os.getenv("DDB_TABLE_COUNTERS", ""))
-    ingest_q = val("ingest_queue_url", "INGEST_QUEUE_URL", default=os.getenv("INGEST_QUEUE_URL"))
-    resize_q = val("resize_queue_url", "RESIZE_QUEUE_URL", default=os.getenv("RESIZE_QUEUE_URL"))
+    region         = val("region", "REGION", default=os.getenv("REGION", "us-east-1"))
+    bucket         = val("bucket_name", "BUCKET_NAME", default=os.getenv("BUCKET_NAME"))
+    ddb_meta       = val("ddb_table_metadata", "DDB_TABLE_METADATA", default=os.getenv("DDB_TABLE_METADATA"))
+    ddb_counters   = val("ddb_table_counters", "DDB_TABLE_COUNTERS", default=os.getenv("DDB_TABLE_COUNTERS", ""))
+    ingest_q       = val("ingest_queue_url", "INGEST_QUEUE_URL", default=os.getenv("INGEST_QUEUE_URL"))
+    resize_q       = val("resize_queue_url", "RESIZE_QUEUE_URL", default=os.getenv("RESIZE_QUEUE_URL"))
     kinesis_stream = val("kinesis_stream_name", "KINESIS_STREAM_NAME", default=os.getenv("KINESIS_STREAM_NAME", ""))
-
-    default_sizes = val("default_sizes", "DEFAULT_SIZES", default=os.getenv("DEFAULT_SIZES", "thumb,medium,large"))
+    default_sizes  = val("default_sizes", "DEFAULT_SIZES", default=os.getenv("DEFAULT_SIZES", "thumb,medium,large"))
 
     if isinstance(default_sizes, str):
         default_sizes = [s.strip() for s in default_sizes.split(",") if s.strip()]
@@ -62,20 +76,15 @@ def _normalize(cfg):
         "DEFAULT_SIZES": default_sizes,
     }
 
-    for k, v in cfg_norm.items():
-        if v in (None, ""):
-            cfg[k] = v
-
-    missing = [k for k in ("BUCKET_NAME", "DDB_TABLE_METADATA", "INGEST_QUEUE_URL", "RESIZE_QUEUE_URL") if not cfg.get(k)]
-
+    missing = [k for k in ("BUCKET_NAME", "DDB_TABLE_METADATA", "INGEST_QUEUE_URL", "RESIZE_QUEUE_URL") if not cfg_norm.get(k)]
     if missing:
         raise RuntimeError(f"Missing required config: {missing}. Provide via AppConfig or ENV.")
-
     return cfg_norm
 
 def load_config():
     cfg = _load_appconfig_extension()
 
+    # ENV overrides on top of AppConfig
     env_overrides = {
         "BUCKET_NAME": os.getenv("BUCKET_NAME"),
         "DDB_TABLE_METADATA": os.getenv("DDB_TABLE_METADATA"),
@@ -86,13 +95,20 @@ def load_config():
         "REGION": os.getenv("REGION"),
         "DEFAULT_SIZES": os.getenv("DEFAULT_SIZES"),
     }
-
     for k, v in env_overrides.items():
         if v not in (None, ""):
             cfg[k] = v
 
-    return _normalize(cfg)
+    norm = _normalize(cfg)
+    # Small redacted config log
+    redacted = dict(norm)
+    for k in ("INGEST_QUEUE_URL", "RESIZE_QUEUE_URL"):
+        if redacted.get(k):
+            redacted[k] = redacted[k].rsplit("/", 1)[-1]
+    log.info("Effective config: %s", redacted)
+    return norm
 
+# -------- Load config & clients --------
 _CFG = load_config()
 REGION = _CFG["REGION"]
 BUCKET = _CFG["BUCKET_NAME"]
@@ -103,101 +119,121 @@ RESIZE_Q_URL = _CFG["RESIZE_QUEUE_URL"]
 KINESIS_STREAM_NAME = _CFG["KINESIS_STREAM_NAME"]
 DEFAULT_SIZES = _CFG["DEFAULT_SIZES"]
 
-log.info("Config: region=%s bucket=%s table=%s ingestQ=%s resizeQ=%s sizes=%s",
-         REGION, BUCKET, DDB_META, INGEST_Q_URL.rsplit('/',1)[-1], RESIZE_Q_URL.rsplit('/',1)[-1], DEFAULT_SIZES)
-
 sqs = boto3.client("sqs", region_name=REGION)
-s3 = boto3.client("s3", region_name=REGION)
+s3  = boto3.client("s3",  region_name=REGION)
 ddb = boto3.client("dynamodb", region_name=REGION)
-kin = boto3.client("kinesis", region_name=REGION)
+kin = boto3.client("kinesis",  region_name=REGION)
 
+# -------- Helpers --------
 def receive(queue_url):
-    return sqs.receive_message(
-        QueueUrl=queue_url,
-        MaxNumberOfMessages=5,
-        WaitTimeSeconds=20,
-        VisibilityTimeout=60
-    ).get("Messages", [])
+    qname = queue_url.rsplit("/", 1)[-1]
+    log.debug("Polling SQS '%s' (wait=%ss, vis=%ss)", qname, POLL_WAIT_SECONDS, VISIBILITY_TIMEOUT)
+    try:
+        resp = sqs.receive_message(
+            QueueUrl=queue_url,
+            MaxNumberOfMessages=5,
+            WaitTimeSeconds=POLL_WAIT_SECONDS,
+            VisibilityTimeout=VISIBILITY_TIMEOUT
+        )
+        msgs = resp.get("Messages", [])
+        if msgs:
+            log.info("Received %d message(s) from '%s'", len(msgs), qname)
+        else:
+            log.debug("No messages from '%s'", qname)
+        return msgs
+    except Exception as e:
+        log.exception("SQS receive_message failed for '%s': %s", qname, e)
+        return []
 
 def delete(queue_url, receipt):
-    sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+    qname = queue_url.rsplit("/", 1)[-1]
+    try:
+        sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt)
+        log.debug("Deleted message from '%s'", qname)
+    except Exception as e:
+        log.warning("Delete failed for '%s': %s", qname, e)
 
 def _is_original_key(key: str) -> bool:
     last = key.rsplit('/', 1)[-1]
     return last.startswith("original")
 
+# -------- Handlers --------
 def handle_s3_ingest(evt):
+    log.info("Handling S3 ingest event with %d record(s)", len(evt.get("Records", [])))
     for rec in evt["Records"]:
-        b = rec["s3"]["bucket"]["name"]
-        raw_key = rec["s3"]["object"]["key"]
-        key = unquote_plus(raw_key)
+        try:
+            b = rec["s3"]["bucket"]["name"]
+            raw_key = rec["s3"]["object"]["key"]
+            key = unquote_plus(raw_key)
+            log.info("S3 event: bucket=%s key=%s", b, key)
 
-        if not _is_original_key(key):
-            continue
+            if not _is_original_key(key):
+                log.info("Skipping key (not original.*): %s", key)
+                continue
 
-        parts = key.split("/")
-        image_id = parts[1] if len(parts) >= 3 else None
+            parts = key.split("/")
+            image_id = parts[1] if len(parts) >= 3 else None
+            if not image_id:
+                log.warning("Could not parse imageId from key %s", key)
+                continue
 
-        if not image_id:
-            log.warning("Could not parse imageId from key %s", key)
-            continue
+            head = s3.head_object(Bucket=b, Key=key)
+            size_bytes = head["ContentLength"]
+            obj = s3.get_object(Bucket=b, Key=key)
+            data = obj["Body"].read()
+            im = Image.open(io.BytesIO(data))
+            width, height = im.size
+            log.info("Original stats id=%s bytes=%s WxH=%sx%s", image_id, size_bytes, width, height)
 
-        head = s3.head_object(Bucket=b, Key=key)
-        size_bytes = head["ContentLength"]
-        obj = s3.get_object(Bucket=b, Key=key)
-        data = obj["Body"].read()
-        im = Image.open(io.BytesIO(data))
-        width, height = im.size
+            ddb.update_item(
+                TableName=DDB_META,
+                Key={"id": {"S": image_id}},
+                UpdateExpression="SET #st = :u, s3_key = :k, #w = :w, #h = :h, bytes = :b",
+                ExpressionAttributeNames={"#st":"status","#w":"width","#h":"height"},
+                ExpressionAttributeValues={
+                    ":u":{"S":"UPLOADED"},
+                    ":k":{"S": key},
+                    ":w":{"N": str(width)},
+                    ":h":{"N": str(height)},
+                    ":b":{"N": str(size_bytes)}
+                }
+            )
+            log.info("DDB updated for %s -> status=UPLOADED", image_id)
 
-        ddb.update_item(
-            TableName=DDB_META,
-            Key={"id": {"S": image_id}},
-            UpdateExpression="SET #st = :u, s3_key = :k, #w = :w, #h = :h, bytes = :b",
-            ExpressionAttributeNames={"#st":"status","#w":"width","#h":"height"},
-            ExpressionAttributeValues={
-                ":u":{"S":"UPLOADED"},
-                ":k":{"S": key},
-                ":w":{"N": str(width)},
-                ":h":{"N": str(height)},
-                ":b":{"N": str(size_bytes)}
-            }
-        )
+            for sz in DEFAULT_SIZES:
+                body = json.dumps({"type":"resize","bucket": b,"key": key,"imageId": image_id,"size": sz})
+                resp = sqs.send_message(QueueUrl=RESIZE_Q_URL, MessageBody=body)
+                log.info("Enqueued resize task %s for %s (MessageId=%s)", sz, image_id, resp.get("MessageId"))
 
-        for sz in DEFAULT_SIZES:
-            body = json.dumps({"type":"resize","bucket": b,"key": key,"imageId": image_id,"size": sz})
-            sqs.send_message(QueueUrl=RESIZE_Q_URL, MessageBody=body)
-
-        if KINESIS_STREAM_NAME:
-            try:
-                kin.put_record(StreamName=KINESIS_STREAM_NAME, PartitionKey=image_id, Data=json.dumps({"imageId": image_id, "action":"uploaded"}))
-            except Exception as e:
-                log.warning("Kinesis put failed: %s", e)
+            if KINESIS_STREAM_NAME:
+                try:
+                    kin.put_record(StreamName=KINESIS_STREAM_NAME, PartitionKey=image_id,
+                                   Data=json.dumps({"imageId": image_id, "action":"uploaded"}))
+                    log.info("Kinesis signaled 'uploaded' for %s", image_id)
+                except Exception as e:
+                    log.warning("Kinesis put failed for %s: %s", image_id, e)
+        except Exception as e:
+            log.exception("Error handling S3 record: %s", e)
 
 def target_dims(size_name, src_w, src_h):
     targets = {"thumb": 150, "medium": 800, "large": 1600}
     tw = targets.get(size_name, 800)
-    scale = tw / float(src_w)
-
-    return int(tw), int(src_h * scale)
+    scale = max(1e-9, tw / float(src_w))
+    return int(tw), int(round(src_h * scale))
 
 def handle_resize_task(task):
-    image_id = task["imageId"]
-    src_key = task["key"]
-    size_name = task["size"]
-
+    image_id = task["imageId"]; src_key = task["key"]; size_name = task["size"]
+    log.info("Resizing %s -> %s", image_id, size_name)
     obj = s3.get_object(Bucket=BUCKET, Key=src_key)
     data = obj["Body"].read()
     im = Image.open(io.BytesIO(data)).convert("RGB")
-
     w, h = im.size
     tw, th = target_dims(size_name, w, h)
     im_resized = im.resize((tw, th), Image.LANCZOS)
     out = io.BytesIO()
     im_resized.save(out, format="JPEG", quality=90)
     out.seek(0)
-
     dest_key = f"images/{image_id}/{size_name}.jpg"
-
     s3.put_object(Bucket=BUCKET, Key=dest_key, Body=out.getvalue(), ContentType="image/jpeg")
     ddb.update_item(
         TableName=DDB_META,
@@ -209,8 +245,9 @@ def handle_resize_task(task):
             ":p": {"S": "PROCESSED"}
         }
     )
-    log.info("Generated %s for %s", size_name, image_id)
+    log.info("Generated %s for %s -> %s", size_name, image_id, dest_key)
 
+# -------- Main loop --------
 _RUN = True
 def _sigterm(*_):
     global _RUN
@@ -220,10 +257,26 @@ def _sigterm(*_):
 signal.signal(signal.SIGTERM, _sigterm)
 signal.signal(signal.SIGINT, _sigterm)
 
-def main_loop():
-    log.info("Worker starting; ingest=%s resize=%s", INGEST_Q_URL, RESIZE_Q_URL)
+def _queue_stats_every(loop_idx):
+    if QUEUE_STATS_EVERY and loop_idx % QUEUE_STATS_EVERY == 0:
+        try:
+            for name, qurl in (("ingest", INGEST_Q_URL), ("resize", RESIZE_Q_URL)):
+                attrs = sqs.get_queue_attributes(
+                    QueueUrl=qurl,
+                    AttributeNames=["ApproximateNumberOfMessages","ApproximateNumberOfMessagesNotVisible"]
+                ).get("Attributes", {})
+                log.info("QStats %-6s: visible=%s inflight=%s",
+                         name, attrs.get("ApproximateNumberOfMessages"), attrs.get("ApproximateNumberOfMessagesNotVisible"))
+        except Exception as e:
+            log.debug("QStats fetch failed: %s", e)
 
+def main_loop():
+    log.info("Worker starting; ingest=%s resize=%s wait=%ss vis=%ss",
+             INGEST_Q_URL.rsplit('/',1)[-1], RESIZE_Q_URL.rsplit('/',1)[-1],
+             POLL_WAIT_SECONDS, VISIBILITY_TIMEOUT)
+    loop = 0
     while _RUN:
+        loop += 1
         msgs = receive(RESIZE_Q_URL)
         src_queue = RESIZE_Q_URL
 
@@ -232,26 +285,26 @@ def main_loop():
             src_queue = INGEST_Q_URL
 
         if not msgs:
+            if HEARTBEAT_EVERY and loop % HEARTBEAT_EVERY == 0:
+                log.info("Heartbeat: idle (loop=%d)", loop)
+            _queue_stats_every(loop)
             continue
+
         for m in msgs:
             payload = None
             try:
-                body = m["Body"]
+                body = m.get("Body", "")
                 payload = json.loads(body)
-
                 if "Records" in payload:
                     handle_s3_ingest(payload)
                 elif payload.get("type") == "resize":
                     handle_resize_task(payload)
                 else:
-                    log.warning("Unknown message: %s", body[:200])
+                    log.warning("Unknown message shape (first 200 chars): %s", body[:200])
             except Exception as e:
                 log.exception("Error handling message: %s", e)
             finally:
-                try:
-                    delete(src_queue, m["ReceiptHandle"])
-                except Exception as e:
-                    log.warning("Delete failed: %s", e)
+                delete(src_queue, m["ReceiptHandle"])
 
 if __name__ == "__main__":
     try:

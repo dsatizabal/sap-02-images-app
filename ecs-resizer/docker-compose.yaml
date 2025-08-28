@@ -1,33 +1,57 @@
-version: "3.8"
 services:
   appconfig:
     image: public.ecr.aws/aws-appconfig/aws-appconfig-agent:2.x
     environment:
       AWS_REGION: us-east-1
       AWS_DEFAULT_REGION: us-east-1
+      # AWS_PROFILE: your-profile
     volumes:
       - ~/.aws:/root/.aws:ro
     ports:
-      - "2772:2772"   # so you can curl it from your host too
+      - "2772:2772"
 
   resizer:
     image: resizer:v1
     network_mode: "service:appconfig"
     environment:
-      # tell the worker where the agent is
       APPCONFIG_APPLICATION: images-app
       APPCONFIG_ENVIRONMENT: dev
       APPCONFIG_PROFILE: resizer
+      AWS_REGION: us-east-1
+      LOG_LEVEL: DEBUG
+      WAIT_MAX_ATTEMPTS: "120"
+      WAIT_DELAY_SECONDS: "0.5"
+      WAIT_LOG_EVERY: "10"
+      # APPCONFIG_BASE_URL: http://localhost:2772
     depends_on:
       - appconfig
     command: >
       sh -lc '
-        echo "Waiting for AppConfig agent on localhost:2772..." ;
-        until curl -sf http://localhost:2772/ >/dev/null 2>&1 ; do
-          sleep 0.5 ;
-        done ;
-        echo "Agent is up; starting worker" ;
-        python -u app.py
+        set -eu;
+        BASE="$${APPCONFIG_BASE_URL:-http://localhost:2772}";
+        APP="$${APPCONFIG_APPLICATION:-}";
+        ENV="$${APPCONFIG_ENVIRONMENT:-}";
+        PROF="$${APPCONFIG_PROFILE:-}";
+        URL="$$BASE/applications/$$APP/environments/$$ENV/configurations/$$PROF";
+        MAX="$${WAIT_MAX_ATTEMPTS:-120}";
+        DELAY="$${WAIT_DELAY_SECONDS:-0.5}";
+        LOGN="$${WAIT_LOG_EVERY:-10}";
+        echo "Waiting for AppConfig agent at $$URL (max $$MAX attempts, delay $$DELAY s)…";
+        i=1;
+        while true; do
+          if curl -sf --max-time 2 "$$URL" >/dev/null 2>&1; then
+            echo "Agent is up; starting worker";
+            exec python -u app.py;
+          fi
+          if [ "$$i" -ge "$$MAX" ]; then
+            echo "ERROR: AppConfig agent not reachable after $$MAX attempts. Exiting."; exit 1;
+          fi
+          if [ $(( $$i % $$LOGN )) -eq 0 ]; then
+            echo "Still waiting… attempt $$i/$$MAX";
+          fi
+          i=$((i+1));
+          sleep "$$DELAY";
+        done
       '
     volumes:
       - ~/.aws:/root/.aws:ro
