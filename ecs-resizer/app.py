@@ -20,6 +20,8 @@ def _load_appconfig_extension():
     base = os.getenv("APPCONFIG_BASE_URL", "http://localhost:2772")
     url  = f"{base}/applications/{app}/environments/{env}/configurations/{profile}"
 
+    print("Loading config from AppConfig extension:", url)
+
     try:
         with urllib.request.urlopen(url, timeout=1.5) as r:
             txt = r.read().decode("utf-8")
@@ -60,7 +62,11 @@ def _normalize(cfg):
         "DEFAULT_SIZES": default_sizes,
     }
 
-    missing = [k for k in ("BUCKET_NAME", "DDB_TABLE_METADATA", "INGEST_QUEUE_URL", "RESIZE_QUEUE_URL") if not cfg_norm.get(k)]
+    for k, v in cfg_norm.items():
+        if v in (None, ""):
+            cfg[k] = v
+
+    missing = [k for k in ("BUCKET_NAME", "DDB_TABLE_METADATA", "INGEST_QUEUE_URL", "RESIZE_QUEUE_URL") if not cfg.get(k)]
 
     if missing:
         raise RuntimeError(f"Missing required config: {missing}. Provide via AppConfig or ENV.")
