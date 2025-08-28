@@ -21,7 +21,7 @@ def load_appconfig_extension():
 
     if not (app and env and profile):
         return {}
-    
+
     url = f"http://localhost:2772/applications/{app}/environments/{env}/configurations/{profile}"
 
     try:
@@ -115,7 +115,7 @@ def normalize(cfg):
 
     if missing:
         raise RuntimeError(f"Missing required config: {missing}. Provide via AppConfig (preferred) or environment variables.")
-    
+
     return out
 
 def load_config():

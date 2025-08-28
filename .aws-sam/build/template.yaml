@@ -19,7 +19,7 @@ Resources:
         Variables:
           APPCONFIG_APPLICATION: images-app
           APPCONFIG_ENVIRONMENT: dev
-          APPCONFIG_PROFILE: dev
+          APPCONFIG_PROFILE: uploader
       Events:
         Api:
           Type: HttpApi
