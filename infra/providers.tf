@@ -1,9 +1,13 @@
-provider "aws" {
-  region = var.region
+terraform {
+  required_version = ">= 1.6.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = ">= 5.40.0"
+    }
+  }
 }
 
-# us-east-1 provider for Lambda@Edge & CloudFront associations
 provider "aws" {
-  alias  = "use1"
-  region = "us-east-1"
+  region = var.aws_region
 }

@@ -1,35 +1,31 @@
-variable "project_name" {
+variable "aws_region" {
+  description = "AWS region"
   type        = string
-  description = "Project name prefix for resource naming."
-  default     = "img-pipeline"
 }
 
-variable "region" {
-  type        = string
-  description = "AWS region to deploy the stack (except Lambda@Edge which must be us-east-1)."
-  default     = "us-east-1"
+# Optional placeholders if your tooling requires them (not used by provider)
+variable "client_id" {
+  type      = string
+  default   = null
+  sensitive = true
 }
 
-variable "lambda_uploader_zip_path" {
-  type        = string
-  description = "Path to the zipped Lambda uploader package."
-  default     = "../lambda-uploader/lambda_uploader.zip"
+variable "client_secret" {
+  type      = string
+  default   = null
+  sensitive = true
 }
 
-variable "lambda_edge_zip_path" {
-  type        = string
-  description = "Path to the zipped Lambda@Edge package (Node.js). Must be deployed in us-east-1."
-  default     = "../lambda-edge/lambda_edge.zip"
+variable "name_prefix" {
+  type    = string
+  default = "images-app"
 }
 
-variable "ecs_worker_image" {
-  type        = string
-  description = "ECR image URI for the ECS worker (e.g., 123456789012.dkr.ecr.us-east-1.amazonaws.com/img-worker:latest)."
-  default     = "REPLACE_WITH_ECR_IMAGE_URI"
+variable "allowed_origin" {
+  type    = string
+  default = "http://localhost:5173"
 }
 
-variable "image_sizes" {
-  type        = list(string)
-  description = "Variants to generate."
-  default     = ["thumb","medium","large"]
+variable "worker_image" {
+  type = string
 }

@@ -9,7 +9,7 @@ export default defineConfig({
     proxy: {
       // Anything starting with /api → forward to SAM local on 3000
       '/api': {
-        target: 'http://127.0.0.1:3000',
+        target: 'https://ktjo7vqhpk.execute-api.us-east-1.amazonaws.com',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, '')
       }
